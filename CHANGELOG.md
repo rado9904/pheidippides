@@ -2,13 +2,14 @@
 
 ## Unreleased
 
-- Revoking a member no longer strands the space. Records a device signed before
-  its revocation (messages, reactions, settings, channel rosters, the
-  certificates and revocations it issued) stay verifiable, so other members keep
-  working and new devices can still enroll; a revocation only invalidates what
-  its target signs afterwards. Before, every client failed to open with
+- Revoking a member no longer strands the space. Channel rosters a later roster
+  signed by an active device chains back to stay verifiable, the revoker re-signs
+  space settings the revoked member had issued, messages already cached stay
+  readable, and a device enrolling after the revocation accepts certificates
+  issued before it. Before, every client failed to open or enroll with
   `invalid trust chain: revoked device` once a person who had created the space,
-  changed settings or issued a roster was revoked.
+  changed settings or issued a roster was revoked. Records a revoked device
+  signs afterwards are still rejected.
 - The space root cannot be revoked (client and server refuse with a clear
   message): every certificate chains to it.
 - `phi wait` splits a long wait into polls of at most 45 s and retries a few

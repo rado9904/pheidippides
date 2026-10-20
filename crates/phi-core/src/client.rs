@@ -318,8 +318,10 @@ impl Client {
                     .iter()
                     .rposition(|r| r.data.epoch == key.epoch())
                     .ok_or_else(|| user("historical epoch has no authenticated roster"))?;
-                directory
-                    .verify_membership(records[index], index.checked_sub(1).map(|i| records[i]))?
+                directory.verify_past_membership(
+                    records[index],
+                    index.checked_sub(1).map(|i| records[i]),
+                )?
             };
             // Read and check encrypted peer context before giving a device any key.
             let meta_key = grant_keys
@@ -1003,7 +1005,12 @@ impl Client {
                 }
                 after = message.seq;
                 let verified = (|| -> Result<_> {
-                    let author = self.directory.verify_message(&message)?;
+                    // Already cached means it verified while its author was active.
+                    let author = if self.cached_message(message.id)?.is_some() {
+                        self.directory.verify_cached_message(&message)?
+                    } else {
+                        self.directory.verify_message(&message)?
+                    };
                     let content = decrypt_message(
                         &self.key(channel, message.envelope.epoch)?,
                         &author,
@@ -1115,9 +1122,9 @@ impl Client {
         Ok(messages)
     }
     async fn load_thread(&mut self, thread: MessageId) -> Result<Vec<DecodedMessage>> {
-        let root: Message = match self.cached_message(thread)? {
-            Some(message) => message,
-            None => self.http.get(&format!("/messages/{thread}")).await?,
+        let (root, cached): (Message, bool) = match self.cached_message(thread)? {
+            Some(message) => (message, true),
+            None => (self.http.get(&format!("/messages/{thread}")).await?, false),
         };
         if self.directory.device(root.author_device).is_err()
             || self
@@ -1133,7 +1140,11 @@ impl Client {
         if root.id != thread || root.envelope.thread_id.is_some() {
             return Err(user("read requires a thread root ID"));
         }
-        self.directory.verify_message(&root)?;
+        if cached {
+            self.directory.verify_cached_message(&root)?;
+        } else {
+            self.directory.verify_message(&root)?;
+        }
         let messages = self
             .sync_channel(root.envelope.channel_id, Some(thread))
             .await?;
@@ -1142,7 +1153,8 @@ impl Client {
             .filter(|m| m.message.id == thread || m.message.envelope.thread_id == Some(thread))
             .collect();
         if let Some(root) = messages.first() {
-            self.directory.verify_message(&root.message)?;
+            // Each entry was verified when synced or cached; this only re-checks identity.
+            self.directory.verify_cached_message(&root.message)?;
         }
         if messages
             .first()
@@ -1241,10 +1253,16 @@ impl Client {
             return Ok(reference.thread);
         }
         let message: Message = match self.cached_message(id)? {
-            Some(message) => message,
-            None => self.http.get(&format!("/messages/{id}")).await?,
+            Some(message) => {
+                self.directory.verify_cached_message(&message)?;
+                message
+            }
+            None => {
+                let message = self.http.get(&format!("/messages/{id}")).await?;
+                self.directory.verify_message(&message)?;
+                message
+            }
         };
-        self.directory.verify_message(&message)?;
         if message.id != id {
             return Err(user("message lookup changed requested ID"));
         }
@@ -2495,7 +2513,20 @@ impl Client {
         self.publish_pending_revocations().await?;
         self.refresh().await?;
         self.resume_rotations().await?;
-        self.refresh().await
+        self.refresh().await?;
+        // Settings verify against their issuer's current standing; re-sign them so
+        // devices that have not accepted this change yet (or enroll later) can.
+        if let Some(change) = self.cache.get::<SettingsChange>("settings")? {
+            let issuer = &self.directory.certificate(change.data.issuer_device)?.data;
+            let revoked = match target {
+                RevocationTarget::Device { device_id } => device_id == issuer.device_id,
+                RevocationTarget::Person { person_id } => person_id == issuer.person_id,
+            };
+            if revoked {
+                self.publish_settings(change.data.settings).await?;
+            }
+        }
+        Ok(())
     }
     pub async fn set_settings(&mut self, key: &str, value: &str) -> Result<SettingsChange> {
         self.begin_operation().await?;
@@ -2524,6 +2555,9 @@ impl Client {
                 ));
             }
         }
+        self.publish_settings(settings).await
+    }
+    async fn publish_settings(&mut self, settings: SpaceSettings) -> Result<SettingsChange> {
         let change = sign_settings(
             SettingsChangeData {
                 space_id: self.profile.space_id,
@@ -2551,7 +2585,7 @@ impl Client {
         Ok(response)
     }
     fn decode_cached_message(&self, message: Message) -> Result<DecodedMessage> {
-        let author = self.directory.verify_message(&message)?;
+        let author = self.directory.verify_cached_message(&message)?;
         let content = decrypt_message(
             &self.key(message.envelope.channel_id, message.envelope.epoch)?,
             &author,
