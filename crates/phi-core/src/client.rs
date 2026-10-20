@@ -2474,6 +2474,14 @@ impl Client {
                 "use another device/person to revoke this device so it can finish key rotation",
             ));
         }
+        let root = &self.directory.root().data;
+        if matches!(target, RevocationTarget::Device { device_id } if device_id == root.device_id)
+            || matches!(target, RevocationTarget::Person { person_id } if person_id == root.person_id)
+        {
+            return Err(user(
+                "the space root cannot be revoked: every certificate chains to it; create a new space instead",
+            ));
+        }
         let revocation = sign_revocation(
             RevocationData {
                 space_id: self.profile.space_id,

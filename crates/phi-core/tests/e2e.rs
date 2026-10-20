@@ -1957,3 +1957,67 @@ async fn wait_survives_transient_gateway_errors() -> Result<()> {
     ensure!(error.as_deref().is_some_and(|e| e.contains("HTTP 502")));
     Ok(())
 }
+
+#[tokio::test]
+async fn revoking_the_space_root_is_refused() -> Result<()> {
+    let f = Fixture::new().await?;
+    let (mut alice, mut bob) = f.pair().await?;
+    let link = alice.invite(false, false).await?;
+    let mut carol = Client::join(f.store("carol"), &link, "carol").await?;
+    for target in [
+        RevocationTarget::Person {
+            person_id: alice.profile.person_id,
+        },
+        RevocationTarget::Device {
+            device_id: alice.profile.device_id,
+        },
+    ] {
+        let error = bob.revoke(target).await.err().map(|e| e.to_string());
+        ensure!(
+            error.as_deref().is_some_and(|e| e.contains("root")),
+            "root revocation accepted: {error:?}"
+        );
+    }
+    carol.refresh().await?;
+    bob.fetch().await?;
+    alice
+        .send("#all", "Still here", options("root keeps working"))
+        .await?;
+    ensure!(carol.wait_text(0).await?.contains("root keeps working"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn revoked_member_history_stays_verifiable() -> Result<()> {
+    let f = Fixture::new().await?;
+    let (mut alice, mut bob) = f.pair().await?;
+    let link = alice.invite(false, false).await?;
+    let mut carol = Client::join(f.store("carol"), &link, "carol").await?;
+    bob.set_settings("summary_every", "5").await?;
+    bob.group_create("backend", &["@carol".into()]).await?;
+    let root = bob
+        .send("#all", "Hello", options("signed before revocation"))
+        .await?;
+    bob.send("#backend", "Group", options("group history"))
+        .await?;
+    carol.wait_text(0).await?;
+    alice
+        .revoke(RevocationTarget::Person {
+            person_id: bob.profile.person_id,
+        })
+        .await?;
+    carol.refresh().await?;
+    ensure!(carol.settings.summary_every == 5);
+    let view = carol.read(root.id, ReadOptions::default()).await?;
+    ensure!(view.text().contains("signed before revocation"));
+    let enrollment = carol.invite(true, false).await?;
+    let mut laptop = Client::join(f.store("carol-laptop"), &enrollment, "carol").await?;
+    ensure!(laptop.settings.summary_every == 5);
+    let sent = laptop
+        .send("#backend", "After", options("group still usable"))
+        .await?;
+    let view = carol.read(sent.id, ReadOptions::default()).await?;
+    ensure!(view.text().contains("group still usable"));
+    ensure!(alice.counts().await.is_ok());
+    Ok(())
+}

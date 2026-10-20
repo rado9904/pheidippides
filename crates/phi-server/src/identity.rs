@@ -256,6 +256,14 @@ impl Db {
             if bundle.revocations.contains(&rev) {
                 return Ok(rev);
             }
+            // Every certificate chains to the root; revoking it would strand the space.
+            let root = &bundle.root.data;
+            if match rev.data.target {
+                RevocationTarget::Device { device_id } => device_id == root.device_id,
+                RevocationTarget::Person { person_id } => person_id == root.person_id,
+            } {
+                return Err(ApiError::invalid("the space root cannot be revoked"));
+            }
             bundle.revocations.push(rev.clone());
             let verified = phi_crypto::verify_trust_bundle(a.sid(), &bundle, now(), Some(&pinned))?;
             db.pin_trust(a.sid(), &verified)?;

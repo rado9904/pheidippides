@@ -199,6 +199,9 @@ impl VerifiedDirectory {
     pub fn revocations(&self) -> &[Revocation] {
         &self.revocations
     }
+    pub fn root(&self) -> &DeviceCertificate {
+        &self.root
+    }
     /// Persist only after successful verification; reload as trusted prior state.
     pub fn pinned_state(&self) -> PinnedTrustState {
         PinnedTrustState {
@@ -237,6 +240,22 @@ impl VerifiedDirectory {
             certificate: cert.clone(),
         })
     }
+    /// A device as the signer of a record created at `at`: a revocation only
+    /// invalidates what its target signs afterwards, so revoking a member never
+    /// makes the history others already hold unverifiable.
+    pub fn device_at(&self, id: DeviceId, at: Timestamp) -> Result<VerifiedDevice, CryptoError> {
+        let cert = self
+            .certificates
+            .get(&id)
+            .ok_or(CryptoError::Trust("unknown device"))?;
+        if revoked_at(&self.revocations, &cert.data, at) {
+            return Err(CryptoError::Trust("signed after revocation"));
+        }
+        Ok(VerifiedDevice {
+            context: self.context,
+            certificate: cert.clone(),
+        })
+    }
     pub fn active_devices(&self) -> impl Iterator<Item = VerifiedDevice> + '_ {
         self.certificates
             .values()
@@ -248,7 +267,7 @@ impl VerifiedDirectory {
             })
     }
     pub fn verify_message(&self, message: &Message) -> Result<VerifiedDevice, CryptoError> {
-        let author = self.device(message.author_device)?;
+        let author = self.device_at(message.author_device, message.created_at)?;
         if message.envelope.space_id != self.space_id
             || message.author_person != author.certificate.data.person_id
             || message.id != message.envelope.id
@@ -265,7 +284,7 @@ impl VerifiedDirectory {
         Ok(author)
     }
     pub fn verify_reaction(&self, reaction: &Reaction) -> Result<(), CryptoError> {
-        let author = self.device(reaction.data.device_id)?;
+        let author = self.device_at(reaction.data.device_id, reaction.data.created_at)?;
         if reaction.data.space_id != self.space_id
             || reaction.data.person_id != author.certificate.data.person_id
         {
@@ -282,7 +301,7 @@ impl VerifiedDirectory {
         if change.data.space_id != self.space_id {
             return Err(CryptoError::Trust("settings space mismatch"));
         }
-        let author = self.device(change.data.issuer_device)?;
+        let author = self.device_at(change.data.issuer_device, change.data.created_at)?;
         verify_signature(
             &author.certificate.data.sign_pub,
             &settings_signing_bytes(&change.data)?,
@@ -291,8 +310,10 @@ impl VerifiedDirectory {
     }
 }
 fn revoked_at(revocations: &[Revocation], cert: &DeviceCertificateData, at: Timestamp) -> bool {
+    // Clocks are whole seconds; what the host accepted in the revocation's own
+    // second still came before it, so only strictly later records count.
     revocations.iter().any(|r| {
-        r.data.created_at <= at
+        r.data.created_at < at
             && match r.data.target {
                 RevocationTarget::Device { device_id } => device_id == cert.device_id,
                 RevocationTarget::Person { person_id } => person_id == cert.person_id,
@@ -471,14 +492,21 @@ pub fn verify_trust_bundle(
             &revocation.signature,
         )?;
     }
-    // Signed wall clocks cannot establish ordering. Current revocation dominates;
-    // exact previously pinned evidence is the only historical-issuance exception.
+    // Signed wall clocks cannot establish ordering, so for a verifier with pinned
+    // state the current revocation dominates and exact previously pinned evidence
+    // is the only historical-issuance exception. A verifier without pins (a device
+    // enrolling after the revocation) has no such evidence; it falls back to the
+    // signed clocks, otherwise revoking anyone who ever invited or enrolled a
+    // device (the root included) would strand every later device. The host refuses
+    // redeems and revocations from devices it knows as revoked, so backdating needs
+    // a colluding host, which could as well withhold the revocation itself.
+    let effective = |signed_at: Timestamp| if pinned.is_some() { now } else { signed_at };
     for cert in grant_certificates.values() {
         let CertificateIssuer::Grant { grant_id } = cert.data.issuer else {
             return Err(CryptoError::Trust("non-root device issuer"));
         };
         let issuer = &certificates[&grants[&grant_id].data.issuer_device];
-        if revoked_at(&revocations, &issuer.data, now)
+        if revoked_at(&revocations, &issuer.data, effective(cert.data.created_at))
             && !pinned.is_some_and(|prior| prior.bundle.certificates.contains(cert))
         {
             return Err(CryptoError::Trust(
@@ -492,8 +520,11 @@ pub fn verify_trust_bundle(
             RevocationTarget::Device { device_id } => device_id == issuer.data.device_id,
             RevocationTarget::Person { person_id } => person_id == issuer.data.person_id,
         };
-        if revoked_at(&revocations, &issuer.data, now)
-            && !self_revocation
+        if revoked_at(
+            &revocations,
+            &issuer.data,
+            effective(revocation.data.created_at),
+        ) && !self_revocation
             && !pinned.is_some_and(|prior| prior.bundle.revocations.contains(revocation))
         {
             return Err(CryptoError::Trust(
@@ -569,17 +600,17 @@ impl VerifiedDirectory {
         if membership.data.space_id != self.space_id {
             return Err(CryptoError::Trust("membership space mismatch"));
         }
-        let issuer = if pinned == Some(membership) {
-            VerifiedDevice {
-                context: self.context,
-                certificate: self
-                    .certificates
-                    .get(&membership.data.issuer_device)
-                    .ok_or(CryptoError::Trust("unknown membership issuer"))?
-                    .clone(),
-            }
-        } else {
-            self.device(membership.data.issuer_device)?
+        // Rosters carry no timestamp, and a revoked issuer's past rosters must stay
+        // verifiable for every device walking the chain later (an enrolling one has
+        // nothing pinned). The host already refuses records from revoked devices,
+        // and new epochs are only ever wrapped for active ones.
+        let issuer = VerifiedDevice {
+            context: self.context,
+            certificate: self
+                .certificates
+                .get(&membership.data.issuer_device)
+                .ok_or(CryptoError::Trust("unknown membership issuer"))?
+                .clone(),
         };
         if let Some(prior) = pinned {
             // The prior roster must come from local accepted state, never this response.

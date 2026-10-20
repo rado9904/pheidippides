@@ -810,7 +810,7 @@ fn pinned_issuance_survives_revocation_but_backdated_successors_fail() -> Result
                 device_id: f.root(),
             },
             issuer_device: f.root(),
-            created_at: 30,
+            created_at: 25,
         },
         &f.keys,
     )?);
@@ -822,6 +822,18 @@ fn pinned_issuance_survives_revocation_but_backdated_successors_fail() -> Result
         verified.grant_certificates().get(&grant.id()),
         Some(&f.bundle.certificates[0])
     );
+    // A device enrolling later has nothing pinned; it still accepts certificates
+    // issued before the revocation's own clock, and so can join the space at all.
+    let mut later = f.bundle.clone();
+    later.revocations[0] = sign_revocation(
+        RevocationData {
+            created_at: 50,
+            ..later.revocations[0].data.clone()
+        },
+        &f.keys,
+    )?;
+    assert!(verify_trust_bundle(f.space(), &later, 100, None).is_ok());
+    assert!(verify_trust_bundle(f.space(), &f.bundle, 100, None).is_err());
     let mut equivocation = f.bundle.clone();
     equivocation.certificates[0].data.device_id = DeviceId::from_bytes([9; 16]);
     equivocation.certificates[0] =

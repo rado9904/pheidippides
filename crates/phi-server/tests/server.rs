@@ -2088,3 +2088,47 @@ async fn upload_admission_precedes_body_reads_and_rechecks_revocation() -> TestR
     .await?;
     Ok(())
 }
+#[tokio::test]
+async fn space_root_cannot_be_revoked() -> TestResult {
+    let f = Fixture::new().await?;
+    let person = f.join(&f.root, GrantKind::Invite).await?;
+    for target in [
+        RevocationTarget::Person {
+            person_id: f.root.cert.data.person_id,
+        },
+        RevocationTarget::Device {
+            device_id: f.root.cert.data.device_id,
+        },
+    ] {
+        let rev = sign_revocation(
+            RevocationData {
+                space_id: f.sid,
+                target,
+                issuer_device: person.cert.data.device_id,
+                created_at: person.cert.data.created_at,
+            },
+            &person.key,
+        )?;
+        assert_eq!(
+            request(
+                &f.app,
+                "POST",
+                &f.space("/revocations"),
+                Some(&person.token),
+                CreateRevocationRequest { revocation: rev }
+            )
+            .await?
+            .0,
+            400
+        );
+    }
+    let _: Space = ok(
+        &f.app,
+        "GET",
+        &f.space(""),
+        Some(&f.root.token),
+        json!(null),
+    )
+    .await?;
+    Ok(())
+}
